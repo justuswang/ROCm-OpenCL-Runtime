@@ -2115,6 +2115,132 @@ bool VirtualGPU::submitKernelInternal(const amd::NDRangeContainer& sizes, const 
     dispatchPacket.group_segment_size = ldsUsage + sharedMemBytes;
     dispatchPacket.private_segment_size = devKernel->workGroupInfo()->privateMemSize_;
 
+    if (getenv("AQL_CAPTURE") && (atoi(getenv("AQL_CAPTURE")) == 1)) {
+      // Need to enable 4G address decoder in BIOS before doing capture
+      ///////////////////////// AQL capture start /////////////////////
+      const uint32_t KERNEL_OBJ_METADATA_SIZE = 4 * 1024; // 4 KB
+      static uint32_t aql_pkt_obj_idx = 0;
+
+      fprintf(stdout, "$compute_queue index=0x0\n");
+      // 1. Dump AQL packet
+      fprintf(stdout, "@aql_pkt pkt_id=0x2 pkt_num=0x%x addr=0x%lx\n", aql_pkt_obj_idx, (uint64_t)&dispatchPacket);
+      for (int i = 0; i < sizeof(hsa_kernel_dispatch_packet_t) / sizeof(uint32_t); i++) {
+        fprintf(stdout, "0x%08x\n", ((uint32_t*)&dispatchPacket)[i]);
+      }
+      // 2. Dump kernel object
+      uint64_t kernel_obj_vaddr = (uint64_t)dispatchPacket.kernel_object;
+      uint32_t kernel_arg_count = signature.numParameters(); // signature.numParametersAll(); to show hidden parameters
+      uint32_t kernel_size = gpuKernel.KernelCodeByteSize();
+      const void* kernel_obj_ptr = 0;
+      roc::Device::loaderQueryHostAddress((const void*)kernel_obj_vaddr, &kernel_obj_ptr);
+      uint32_t* kernel_obj = (uint32_t*)kernel_obj_ptr;
+      fprintf(stdout, "@kernel_obj pkt_num=0x%x args=0x%x bytes=0x%x addr=0x%lx\n",
+              aql_pkt_obj_idx,
+              kernel_arg_count,
+              kernel_size,
+              kernel_obj_vaddr);
+      for (int i = 0; i < kernel_size / sizeof(uint32_t); i++) {
+        fprintf(stdout, "0x%08x\n", kernel_obj[i]);
+      }
+      // 3. Dump kernel arg pool
+      uint32_t kernel_args_size = gpuKernel.KernargSegmentByteSize();
+      uint64_t kernel_args_addr = (uint64_t)dispatchPacket.kernarg_address;
+      fprintf(stdout, "@kernel_arg_pool pkt_num=0x%x args_num=0x%x addr=0x%lx bytes=0x%x in\n",
+              aql_pkt_obj_idx,
+              kernel_arg_count,
+              kernel_args_addr,
+              kernel_args_size);
+      for (int i = 0; i < kernel_args_size / sizeof(uint32_t); i++) {
+        fprintf(stdout, "0x%08x\n", ((uint32_t*)kernel_args_addr)[i]);
+      }
+      // 4. Dump kernel args
+      for (uint32_t i = 0; i < kernel_arg_count; ++i) {
+        const amd::KernelParameterDescriptor& desc = signature.at(i);
+        //fprintf(stdout, "type: %d, size: %d\n", desc.type_, desc.size_);
+        //fprintf(stdout, "oclObject_ : %d\n", desc.info_.oclObject_); //MemoryObject
+        //fprintf(stdout, "readOnly_ : %d\n", desc.info_.readOnly_);
+        //fprintf(stdout, "rawPointer_ : %d\n", desc.info_.rawPointer_);
+        //fprintf(stdout, "defined_ : %d\n", desc.info_.defined_);
+        //fprintf(stdout, "addressQualifier_: %d\n", desc.addressQualifier_);//CL_KERNEL_ARG_ADDRESS_GLOBAL
+        //fprintf(stdout, "accessQualifier_: %d\n", desc.accessQualifier_);
+        switch (desc.type_) {
+          case T_SAMPLER:
+          case T_POINTER: {
+            amd::Memory* mem = memories[desc.info_.arrayIndex_];
+            size_t arg_size = mem->getSize();
+
+            //FIXME: Should be desc.type_, but it does not match roc-1.8's ROC_ARGTYPE_* in the GPU Compute Stream Data Spec
+            int arg_type = 1; // ROC_ARGTYPE_POINTER
+
+            uint64_t kernel_arg_vaddr = ((uint64_t*)(kernel_args_addr + desc.offset_))[0];
+            assert(((uint64_t*)kernel_args_addr)[i] == ((uint64_t*)(kernel_args_addr + desc.offset_))[0]);
+            uint64_t ptr = (uint64_t)mem->getHostMem();
+            if (!ptr) {
+              Memory* gpuMem = static_cast<Memory*>(mem->getDeviceMemory(dev(), false));
+              ptr = (uint64_t)gpuMem->getDeviceMemory();
+            }
+
+            if (desc.info_.oclObject_ == amd::KernelParameterDescriptor::ImageObject) {
+              // Refer to ISA spec "8.4.2. Image Resource"
+              ptr = kernel_arg_vaddr;
+              arg_size = 32; // 256 bits
+              arg_type = 4; // ROC_ARGTYPE_IMAGE
+            } else if (desc.type_ == T_SAMPLER) {
+              // Refer to ISA spec "8.4.3. Image Sampler"
+              ptr = kernel_arg_vaddr;
+              arg_size = 16; // 128 bits
+              arg_type = 5; // ROC_ARGTYPE_SAMPLER
+            }
+
+            //FIXME: Currently this solution is not able to distinguish the arg is in or out.
+            //       The arg_type is not the same as rocm-1.8 which needs to either update the spec or add a mapping here.
+            fprintf(stdout, "@kernel_arg pkt_num=0x%x arg_idx=0x%x arg_type=0x%x offset=0x%lx addr=0x%lx bytes=0x%lx in\n",
+                    aql_pkt_obj_idx,
+                    i,
+                    arg_type,
+                    desc.offset_,
+                    kernel_arg_vaddr,
+                    arg_size);
+            for (size_t k = 0; k < arg_size / sizeof(uint32_t); k++) {
+              fprintf(stdout, "0x%08x\n", ((uint32_t*)ptr)[k]);
+            }
+            if (desc.info_.oclObject_ == amd::KernelParameterDescriptor::ImageObject) {
+              int arg_ib_idx = 0;
+              uint64_t image_base_addr = (((uint64_t*)ptr)[0] & 0xffffffffffUL) << 8;
+              Memory* gpuMem = static_cast<Memory*>(mem->getDeviceMemory(dev(), false));
+              ptr = (uint64_t)gpuMem->getDeviceMemory();
+              assert(image_base_addr == ptr);
+              arg_size = mem->getSize();
+              arg_type = 1;
+              fprintf(stdout, "@kernel_arg_ib pkt_num=0x%x arg_idx=0x%x arg_type=0x%x offset=0x%lx addr=0x%lx bytes=0x%lx in\n",
+                    aql_pkt_obj_idx,
+                    i,
+                    arg_type,
+                    desc.offset_,
+                    ptr,
+                    arg_size);
+              for (size_t k = 0; k < arg_size / sizeof(uint32_t); k++) {
+                fprintf(stdout, "0x%08x\n", ((uint32_t*)ptr)[k]);
+              }
+            }
+            break;
+          }
+          default: {
+            fprintf(stdout, "@kernel_arg pkt_num=0x%x arg_idx=0x%x arg_type=0x%x offset=0x%lx addr=0x%x bytes=0x%lx in\n",
+                    aql_pkt_obj_idx,
+                    i,
+                    2, // ROC_ARGTYPE_VALUE
+                    desc.offset_,
+                    0,
+                    desc.size_);
+            break;
+          }
+        }
+      }
+      aql_pkt_obj_idx++;
+      ///////////////////////// AQL capture end /////////////////////
+    }
+
     // Dispatch the packet
     if (!dispatchAqlPacket(&dispatchPacket, GPU_FLUSH_ON_EXECUTION)) {
       return false;
