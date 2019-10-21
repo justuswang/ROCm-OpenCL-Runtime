@@ -34,6 +34,8 @@ class Kernel : public device::Kernel {
 
   const uint8_t KernargSegmentAlignment() const { return kernargSegmentAlignment_; }
 
+  const uint32_t& KernelCodeByteSize() const { return kernelCodeByteSize_; }
+
   ~Kernel() {}
 
   //! Initializes the metadata required for this kernel
@@ -44,6 +46,7 @@ class Kernel : public device::Kernel {
  protected:
 //  Program* program_;                      //!< The roc::Program context
   uint64_t kernelCodeHandle_;             //!< Kernel code handle (aka amd_kernel_code_t)
+  uint32_t kernelCodeByteSize_;
   uint32_t workgroupGroupSegmentByteSize_;
   uint32_t workitemPrivateSegmentByteSize_;
   uint32_t kernargSegmentByteSize_;

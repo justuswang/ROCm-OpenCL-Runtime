@@ -99,6 +99,12 @@ bool LightningKernel::init() {
     return false;
   }
 
+  hsaStatus = hsa_executable_symbol_get_info(symbol, (hsa_executable_symbol_info_t)100, //HSA_EXT_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT_SIZE,
+                                             &kernelCodeByteSize_);
+  if (hsaStatus != HSA_STATUS_SUCCESS) {
+    return false;
+  }
+
   if (!kernelMD.mAttrs.mRuntimeHandle.empty()) {
     hsa_executable_symbol_t kernelSymbol;
     int                     variable_size;
@@ -260,6 +266,24 @@ bool LightningKernel::init() {
     status = hsa_memory_copy(reinterpret_cast<void*>(variable_address), &runtime_handle, variable_size);
     if (status != HSA_STATUS_SUCCESS) {
       return false;
+    }
+  }
+
+  {
+    hsa_agent_t             agent = program()->hsaDevice();
+    hsa_executable_symbol_t kernelSymbol;
+    hsa_status_t            status;
+
+    status = hsa_executable_get_symbol_by_name(program()->hsaExecutable(), name().c_str(),
+                                               &agent, &kernelSymbol);
+    if (status != HSA_STATUS_SUCCESS)  {
+         return false;
+    }
+
+    status = hsa_executable_symbol_get_info(kernelSymbol, (hsa_executable_symbol_info_t)100, //HSA_EXT_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT_SIZE,
+                                            &kernelCodeByteSize_);
+    if (status != HSA_STATUS_SUCCESS) {
+         return false;
     }
   }
 
